@@ -66,10 +66,10 @@ def parseargs():
 def agg_stats(stats, newstat):
     res = newstat
     if stats is not None:
-        res['RSS'] += stats['RSS']
-        res['VSZ'] += stats['VSZ']
-        res['MEM'] += stats['MEM']
-        res['CPU'] += stats['CPU']
+        res['Real Memory MB'] += stats['Real Memory MB']
+        res['Virtual Memory MB'] += stats['Virtual Memory MB']
+        res['Memory %'] += stats['Memory %']
+        res['CPU %'] += stats['CPU %']
     return res
 
 
@@ -91,10 +91,10 @@ def parse_statistics(stats, hostname):
             if m:
                 if not 'idle' in line:
                     data = {
-                            'RSS' : float(m.group(2)),
-                            'VSZ' : float(m.group(3)),
-                            'MEM' : float(m.group(4)),
-                            'CPU' : float(m.group(5)),
+                            'Real Memory MB' : float(m.group(2))/1024.,
+                            'Virtual Memory MB' : float(m.group(3))/1024.,
+                            'Memory %' : float(m.group(4)),
+                            'CPU %' : float(m.group(5)),
                             'User': m.group(6),
                             'DB'  : m.group(7),
                             'Session' : m.group(8),
