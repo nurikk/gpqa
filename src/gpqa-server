@@ -1,0 +1,281 @@
+#!/usr/bin/env python
+
+# Common modules
+import os
+import sys
+import datetime
+import json
+import time
+import signal
+import socket
+import select
+from optparse import OptionParser
+
+# Greenplum modules
+try:
+    from gppylib import gplog
+    from gppylib.commands.base import WorkerPool, REMOTE, Command
+    from gppylib.commands.unix import Scp, FileDirExists, getUserName
+    from gppylib.db import dbconn
+    from gppylib import gparray
+    from gppylib import userinput
+except ImportError, e:
+    sys.exit('ERROR: Cannot import Greenplum modules.  Please check that you have sourced greenplum_path.sh.  Detail: ' + str(e))
+
+
+# GPQA Modules
+try:
+    from gpqalib import pidfile
+except ImportError, e:
+    sys.exit('ERROR: Cannot import GPQA modules.  Please check that you have properly installed GPQA extension. Detail: ' + str(e))
+
+
+# Globals
+PIDFILE = '/tmp/.gpqa-server'
+LISTENHOSTS = {}
+RECVSOCKETS = []
+RECVHOSTS = {}
+GLOBALSTATS = {}
+GLOBALTIMEOUT = 120.0
+
+
+def checkintoption(options, value, errormsg):
+    if options.__dict__.get(value) is None:
+        logger.error(errormsg)
+        graceful_exit(1)
+    try:
+        a = int(options.__dict__.get(value))
+    except Exception, ex:
+        logger.error(errormsg)
+        graceful_exit(1)
+    return
+
+
+def parseargs():
+    parser = OptionParser()
+
+    parser.add_option('-p', '--port', type='string', help='Port for the REST API to listen for incoming connections')
+    parser.add_option('-t', '--tick', type='string', help='Number of milliseconds between statistics collection')
+    parser.add_option('-o', '--portoffset', type='string', help='Port offset for the agent connection listeners')
+    parser.add_option('-v', '--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_option('--batch-size', type='int', default=5)
+
+    (options, args) = parser.parse_args()
+    checkintoption(options, 'port', '-p | --port is mandatory and should specify the port for the REST API')
+    checkintoption(options, 'tick', '-t | --tick is mandatory and should specify the integer number of milliseconds between statistics sampling')
+    checkintoption(options, 'portoffset', '-o | --portoffset is mandatory and should specify the integer number of port offset for the agent connection listeners')
+
+    return options
+
+
+def start_listener(host, masterhost, port):
+    attempts = 10
+    lastexception = None
+    while (attempts > 0):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(60)
+            logger.info('host: %s, port: %d' % (masterhost, port))
+            sock.bind((masterhost, port))
+            sock.listen(5)
+            LISTENHOSTS[host] = sock
+            return (port, (host, sock))
+        except Exception, ex:
+            lastexception = ex
+        attempts -= 1
+        port = port + 1
+    logger.error("Cannot start listener on the port %d and 10 preceding ports, exception is '%s'" % (port, str(lastexception)))
+    graceful_exit(1)
+    return -1
+
+
+def accept_connections(hostsockets):
+    for host, sock in hostsockets:
+        try:
+            sock2, _ = sock.accept()
+        except Exception, ex:
+            logger.error('Cannot accept connection from host "%s"' % host)
+            graceful_exit(1)
+        RECVSOCKETS.append(sock2)
+        RECVHOSTS[sock2] = host
+    return
+
+
+def start_agents(pool, gpdb_hosts, tick, portoffset):
+    masterhost = socket.gethostname()
+    port = portoffset
+    hostsocks = []
+    for hostname in gpdb_hosts:
+        port, hostsock = start_listener(hostname, masterhost, port)
+        hostsocks.append(hostsock)
+        logger.info("Listener started on port %d" % port)
+        master = '%s:%d' % (masterhost, port)
+        cmd = Command('Start GPQA Agent on %s' % hostname,
+                      '/gpqa/src/gpqa-agent-start -l %s -s %s -t %s' % (hostname, master, tick),
+                      ctxt = REMOTE,
+                      remoteHost = hostname)
+        pool.addCommand(cmd)
+        port = port + 1
+    pool.join()
+    pool.check_results()
+    accept_connections(hostsocks)
+    logger.debug('Listener hosts: %s', str(LISTENHOSTS))
+    logger.debug('Receivers: %s', str(RECVSOCKETS))
+    logger.debug('Receive hosts: %s', str(RECVHOSTS))
+
+
+def restart_failed(options, socklist):
+    hosts = []
+    for sock in socklist:
+        host = RECVHOSTS.get(sock)
+        if host is None:
+            logger.error("Select returned unexpected socket in exceptions")
+            graceful_exit(1)
+        hosts.append(host)
+        socklisten = LISTENHOSTS[host]
+        socklisten.close()
+        LISTENHOSTS.pop(host)
+        RECVHOSTS.pop(sock)
+        for i in range(len(RECVSOCKETS)):
+            if sock == RECVSOCKETS[i]:
+                del RECVSOCKETS[i]
+        sock.close()
+    start_agents(WORKERPOOL, hosts, int(options.tick), int(options.portoffset))
+
+
+def receive_message(sock):
+    msglen = sock.recv(8)
+    try:
+        l = int(msglen)
+    except Exception, ex:
+        logger.warning("Cannot parse length received - '%s'" % msglen)
+        return -1
+    msg = sock.recv(int(msglen))
+    if len(msg) != int(msglen):
+        logger.warning("Didn't receive enough data - expected %d, received %d" % (int(msglen), len(msg)))
+        return -1
+    print msg
+    return 0
+
+
+def start_listening(options):
+    exception_count = 0
+    while True:
+        try:
+            ready_to_read, ready_to_write, in_error = select.select(RECVSOCKETS, [], [], GLOBALTIMEOUT)
+            if len(in_error) > 0:
+                restart_failed(options, in_error)
+            if len(ready_to_read) > 0:
+                for sock in ready_to_read:
+                    status = receive_message(sock)
+                    if status != 0:
+                        restart_failed(options, [sock])
+            exception_count = 0
+        except Exception, ex:
+            logger.warning("Exception happened receiving the data: '%s'" % str(ex))
+            exception_count += 1
+        if exception_count > 5:
+            logger.error("Received 5 exceptions sequentially, shutting down")
+            graceful_exit(1)
+    return
+
+def get_gpdb_hosts(segdb_list):
+    gpdb_hosts = set()
+    for s in segdb_list:
+        gpdb_hosts.add(s.getSegmentHostName())
+    return list(gpdb_hosts)
+
+
+def close_sockets():
+    logger.info('Shutting down sockets...')
+    for sock in RECVSOCKETS + LISTENHOSTS.values():
+        try:
+            sock.shutdown()
+            sock.close()
+        except Exception, ex:
+            logger.warning("Failed to shutdown socket with error '%s'" % str(ex))
+    return
+
+
+def close_pool():
+    global WORKERPOOL
+    if WORKERPOOL:
+        logger.info('Shutting down workers...')
+        WORKERPOOL.haltWork()
+        WORKERPOOL.joinWorkers()
+    return
+
+
+def graceful_termination():
+    close_sockets()
+    close_pool()
+    pidfile.pidrelease(PIDFILE)
+
+
+def signal_handler(signal, frame):
+    logger.warning("Processing execution termination signal")
+    graceful_termination()
+    sys.exit(0)
+
+
+def graceful_exit(code):
+    graceful_termination()
+    sys.exit(code)
+
+
+def main():
+    global WORKERPOOL
+    status = pidfile.pidlock(PIDFILE)
+    if status != 'my lock':
+        pid = pidfile.getpid(PIDFILE)
+        os.kill(pid, signal.SIGTERM)
+        status = pidfile.pidlock(PIDFILE)
+        if status != 'my lock':
+            logger.error("GPQA cannot obtain lock on '%s'" % PIDFILE)
+            graceful_exit(1)
+    options = parseargs()
+    if options.verbose:
+        gplog.enable_verbose_logging()
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    try:
+        GPHOME = os.environ.get('GPHOME')
+        if not GPHOME:
+            raise Exception('$GPHOME environment variable is not set')
+
+        logger.info('Retrieving GPDB configuration from database...')
+        url = dbconn.DbURL()
+        array = gparray.GpArray.initFromCatalog(url, True)
+        segs = array.getDbList()
+
+        gpdb_hosts = get_gpdb_hosts(segs)
+        logger.debug('GPDB Configuration is:')
+        for host in gpdb_hosts:
+            logger.debug('    host "%s"' % host)
+
+        logger.info('Starting up workers...')
+        WORKERPOOL = WorkerPool(options.batch_size)
+
+        start_agents(WORKERPOOL, gpdb_hosts, int(options.tick), int(options.portoffset))
+
+        start_listening(options)
+
+    except Exception, e:
+        logger.fatal("%s failed. (Reason='%s') exiting..." % (execname, e))
+        if options.verbose:
+            logger.exception(e)
+
+    finally:
+        graceful_termination()
+
+    logger.info('Done')
+    return
+
+
+if __name__ == '__main__':
+    WORKERPOOL = None
+    execname = os.path.split(__file__)[-1]
+    gplog.setup_tool_logging(execname, socket.gethostname(), getUserName())
+    logger = gplog.get_default_logger()
+    main()

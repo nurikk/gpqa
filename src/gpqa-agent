@@ -22,7 +22,6 @@ except ImportError, e:
 
 
 # GPQA Modules
-# Greenplum modules
 try:
     from gpqalib import pidfile
 except ImportError, e:
@@ -33,6 +32,7 @@ except ImportError, e:
 STATS_COMMAND = "ps -ewwopid,ppid,rss,vsz,pmem,pcpu,time,etime,start_time,wchan,stat,psr,args | grep postgres"
 STATS_REGEXP = re.compile(r'\s*([0-9]+)\s+[0-9]+\s+([0-9]+)\s+([0-9]+)\s+([0-9\.]+)\s+([0-9\.]+) .* postgres: port\s+[0-9]+, (\w+) (\w+).*con([0-9]+).*cmd([0-9]+).*(slice[0-9]+)?')
 PIDFILE = '/tmp/.gpqa-agent'
+TIMEOUT_CONNECTING = 600
 
 
 def parseargs():
@@ -112,21 +112,27 @@ def parse_statistics(stats, hostname):
 
 
 def server_connect(address):
+    timeout = datetime.timedelta(seconds=TIMEOUT_CONNECTING)
     hostname = address.split(':')[0].strip()
     port = int(address.split(':')[1].strip())
-    sock = socket.socket()
-    try:
-        sock.connect((hostname, port))
-    except Exception, ex:
-        logger.error('Cannot connect to "%s", error is "%s"' % (address, str(ex)))
-        sys.exit(1)
-    return sock
+    dtstart = datetime.datetime.now()
+    while (datetime.datetime.now() - dtstart < timeout):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((hostname, port))
+            return sock
+        except Exception, ex:
+            logger.warning('Cannot connect to "%s", error is "%s"' % (address, str(ex)))
+        time.sleep(1)
+    logger.error('Cannot connect to the GPQA-server - timeout reached')
+    sys.exit(1)
+    return
 
 
 def sendmsg(conn, msg):
     totalsent = 0
     while totalsent < len(msg):
-        sent = self.sock.send(msg[totalsent:])
+        sent = conn.send(msg[totalsent:])
         if sent == 0:
             logger.error("Socket conneciton is broken")
             sys.exit(1)
@@ -176,13 +182,17 @@ def main():
     if status != 'my lock':
         pid = pidfile.getpid(PIDFILE)
         os.kill(pid, signal.SIGTERM)
+        time.sleep(1)
         status = pidfile.pidlock(PIDFILE)
         if status != 'my lock':
-            logger.error("GPQA cannot obtain lock on '%s'" % PIDFILE)
-            sys.exit(1)
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(1)
+            status = pidfile.pidlock(PIDFILE)
+            if status != 'my lock':
+                logger.error("GPQA cannot obtain lock on '%s'" % PIDFILE)
+                sys.exit(1)
     options = parseargs()
     conn = server_connect(options.server)
-    return
     get_statistics(options.localhost, conn, int(options.tick))
     server_disconnect(conn)
     pidfile.pidrelease(PIDFILE)

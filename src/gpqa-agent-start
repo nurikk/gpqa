@@ -1,0 +1,4 @@
+#/bin/bash
+
+cd /gpqa/src
+nohup python gpqa-agent $@ >agent.log 2>&1 &
