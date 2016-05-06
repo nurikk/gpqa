@@ -9,7 +9,9 @@ import time
 import signal
 import socket
 import select
+import thread
 from optparse import OptionParser
+from flask import Flask, jsonify
 
 # Greenplum modules
 try:
@@ -37,6 +39,7 @@ RECVSOCKETS = []
 RECVHOSTS = {}
 GLOBALSTATS = {}
 GLOBALTIMEOUT = 120.0
+app = Flask(__name__)
 
 
 def checkintoption(options, value, errormsg):
@@ -143,6 +146,13 @@ def restart_failed(options, socklist):
     start_agents(WORKERPOOL, hosts, int(options.tick), int(options.portoffset))
 
 
+def update_stats(msg):
+    stats = json.loads(msg)
+    GLOBALSTATS[stats['hostname']] = stats
+    logger.debug(GLOBALSTATS)
+    return
+
+
 def receive_message(sock):
     msglen = sock.recv(8)
     try:
@@ -154,7 +164,7 @@ def receive_message(sock):
     if len(msg) != int(msglen):
         logger.warning("Didn't receive enough data - expected %d, received %d" % (int(msglen), len(msg)))
         return -1
-    print msg
+    update_stats(msg)
     return 0
 
 
@@ -223,6 +233,18 @@ def graceful_exit(code):
     sys.exit(code)
 
 
+# REST API SERVICE THREAD START
+
+@app.route('/getstats', methods=['GET'])
+def get_stats():
+    return jsonify(GLOBALSTATS)
+
+
+def rest_api_main(port):
+    app.run(host='0.0.0.0', port=port)
+    
+# REST API SERVICE THREAD END
+
 def main():
     global WORKERPOOL
     status = pidfile.pidlock(PIDFILE)
@@ -236,6 +258,9 @@ def main():
     options = parseargs()
     if options.verbose:
         gplog.enable_verbose_logging()
+
+    # Start REST API first
+    thread.start_new_thread(rest_api_main, (int(options.port),))
 
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
