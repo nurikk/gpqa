@@ -1,0 +1,195 @@
+#!/usr/bin/env python
+
+# Common modules
+import re
+import json
+import datetime
+import os
+import signal
+import sys
+from optparse import OptionParser
+import time
+import socket
+
+
+# Greenplum modules
+try:
+    from gppylib import gplog
+    from gppylib.commands.base import LOCAL, REMOTE, Command
+    from gppylib.commands.unix import getLocalHostname, getUserName
+except ImportError, e:
+    sys.exit('ERROR: Cannot import Greenplum modules.  Please check that you have sourced greenplum_path.sh. Detail: ' + str(e))
+
+
+# GPQA Modules
+# Greenplum modules
+try:
+    from gpqalib import pidfile
+except ImportError, e:
+    sys.exit('ERROR: Cannot import GPQA modules.  Please check that you have properly installed GPQA extension. Detail: ' + str(e))
+
+
+# Globals
+STATS_COMMAND = "ps -ewwopid,ppid,rss,vsz,pmem,pcpu,time,etime,start_time,wchan,stat,psr,args | grep postgres"
+STATS_REGEXP = re.compile(r'\s*([0-9]+)\s+[0-9]+\s+([0-9]+)\s+([0-9]+)\s+([0-9\.]+)\s+([0-9\.]+) .* postgres: port\s+[0-9]+, (\w+) (\w+).*con([0-9]+).*cmd([0-9]+).*(slice[0-9]+)?')
+PIDFILE = '/tmp/.gpqa-agent'
+
+
+def parseargs():
+    parser = OptionParser()
+
+    parser.add_option('-l', '--localhost', type='string', help='Name of the host running the agent')
+    parser.add_option('-s', '--server', type='string', help='Server host:port address to connect back')
+    parser.add_option('-t', '--tick', type='string', help='Number of milliseconds between statistics collection')
+
+    (options, args) = parser.parse_args()
+    if not options.localhost:
+        logger.error('Local host name should be specified for the agent with --localhost or -l flag')
+        sys.exit(1)
+    if not options.server:
+        logger.error('GPQA-server host name and port should be specified for the agent with --server or -s flag')
+        sys.exit(1)
+    if options.server.count(':') != 1:
+        logger.error('GPQA-server parameter (-s | --server) should be in form {hostname}:{port}')
+        sys.exit(1)
+    if not options.tick:
+        logger.error('-t | --tick is mandatory and should specify the number of milliseconds between statistics sampling')
+        sys.exit(1)
+    try:
+        a = int(options.tick)
+    except Exception, ex:
+        logger.error('-t | --tick should be an integer number')
+        sys.exit(1)
+    return options
+
+
+def agg_stats(stats, newstat):
+    res = newstat
+    if stats is not None:
+        res['RSS'] += stats['RSS']
+        res['VSZ'] += stats['VSZ']
+        res['MEM'] += stats['MEM']
+        res['CPU'] += stats['CPU']
+    return res
+
+
+def parse_statistics(stats, hostname):
+    statistics = dict()
+    for line in stats.split('\n'):
+        if not ('logger process' in line
+                or 'primary process' in line
+                or 'primary receiver ack process' in line
+                or 'primary sender process' in line
+                or 'primary consumer ack process' in line
+                or 'primary recovery process' in line
+                or 'primary verification process' in line
+                or 'stats collector process' in line
+                or 'writer process' in line
+                or 'checkpoint process' in line
+                or 'sweeper process' in line):
+            m = STATS_REGEXP.match(line)
+            if m:
+                if not 'idle' in line:
+                    data = {
+                            'RSS' : float(m.group(2)),
+                            'VSZ' : float(m.group(3)),
+                            'MEM' : float(m.group(4)),
+                            'CPU' : float(m.group(5)),
+                            'User': m.group(6),
+                            'DB'  : m.group(7),
+                            'Session' : m.group(8),
+                            'Command' : m.group(9),
+                            'Slice' : m.group(10)
+                        }
+                    session = data['Session']
+                    statistics[session] = agg_stats(statistics.get(session), data)
+    result = json.dumps(
+            {'response' : statistics.values(),
+             'timestamp' : int(time.mktime(datetime.datetime.now().timetuple())),
+             'hostname' : hostname
+            })
+    return result
+
+
+def server_connect(address):
+    hostname = address.split(':')[0].strip()
+    port = int(address.split(':')[1].strip())
+    sock = socket.socket()
+    try:
+        sock.connect((hostname, port))
+    except Exception, ex:
+        logger.error('Cannot connect to "%s", error is "%s"' % (address, str(ex)))
+        sys.exit(1)
+    return sock
+
+
+def sendmsg(conn, msg):
+    totalsent = 0
+    while totalsent < len(msg):
+        sent = self.sock.send(msg[totalsent:])
+        if sent == 0:
+            logger.error("Socket conneciton is broken")
+            sys.exit(1)
+        totalsent = totalsent + sent
+    return
+
+
+def send_stats(conn, stats):
+    msg = str(stats)
+    msglen = '%8d' % len(msg)
+    sendmsg(conn, msglen)
+    sendmsg(conn, msg)
+    print stats
+
+
+def get_statistics(hostname, conn, tickms):
+    logger.debug("Starting the cycle of receiving statistics")
+    tick = datetime.timedelta(milliseconds = tickms)
+    while True:
+        dt1 = datetime.datetime.now()
+        cmd = Command('Get execution statistics on GPDB processes',
+                      STATS_COMMAND,
+                      ctxt = LOCAL)
+        cmd.run(validateAfter=True)
+        res = cmd.get_results()
+        if res.rc != 0:
+            logger.error("Command execution failed with return code %d" % res.rc)
+            logger.error("Stdout received: %s" % res.stdout)
+            logger.error("Stderr received: %s" % res.stderr)
+        else:
+            stats = parse_statistics(res.stdout, hostname)
+            send_stats(conn, stats)
+        dt2 = datetime.datetime.now()
+        if (dt2 - dt1 < tick):
+            delta = tick - (dt2 - dt1)
+            time.sleep(float(delta.seconds) + float(delta.microseconds / 1000000.))
+    return
+
+
+def server_disconnect(conn):
+    conn.shutdown()
+    conn.close()
+
+
+def main():
+    status = pidfile.pidlock(PIDFILE)
+    if status != 'my lock':
+        pid = pidfile.getpid(PIDFILE)
+        os.kill(pid, signal.SIGTERM)
+        status = pidfile.pidlock(PIDFILE)
+        if status != 'my lock':
+            logger.error("GPQA cannot obtain lock on '%s'" % PIDFILE)
+            sys.exit(1)
+    options = parseargs()
+    conn = server_connect(options.server)
+    return
+    get_statistics(options.localhost, conn, int(options.tick))
+    server_disconnect(conn)
+    pidfile.pidrelease(PIDFILE)
+
+
+if __name__ == '__main__':
+    execname = os.path.split(__file__)[-1]
+    gplog.setup_tool_logging(execname, getLocalHostname(), getUserName())
+    logger = gplog.get_default_logger()
+    main()
