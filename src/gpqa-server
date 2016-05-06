@@ -10,6 +10,7 @@ import signal
 import socket
 import select
 import thread
+import re
 from optparse import OptionParser
 from flask import Flask, jsonify
 
@@ -148,7 +149,9 @@ def restart_failed(options, socklist):
 
 def update_stats(msg):
     stats = json.loads(msg)
-    GLOBALSTATS[stats['hostname']] = stats
+    if not 'stats' in GLOBALSTATS:
+        GLOBALSTATS['stats'] = {}
+    GLOBALSTATS['stats'][stats['hostname']] = stats
     logger.debug(GLOBALSTATS)
     return
 
@@ -233,6 +236,64 @@ def graceful_exit(code):
     sys.exit(code)
 
 
+# GPDB QUERIES THREAD START
+
+def execute(conn, query):
+    res = []
+    try:
+        curs = dbconn.execSQL(conn, query)
+        res = curs.fetchall()
+        conn.commit()
+        
+    except Exception, ex:
+        logger.error('Failed to execute the statement on the database. Please, check log file for errors.')
+        logger.error(ex)
+        sys.exit(3)
+    return res
+
+
+def get_queries(conn):
+    queries = execute(conn,
+             """select  sess_id,
+                        usename,
+                        current_query,
+                        coalesce(extract('epoch' from current_timestamp - query_start), 0)
+                    from pg_stat_activity
+                    where current_query <> '<IDLE>'
+                        and not strpos(current_query, 'GPQAQUERY') > 0
+                    order by 4 desc""")
+    res = []
+    for query in queries:
+        res.append({
+                'Session' : int(query[0]),
+                'User' : query[1],
+                'Query' : re.sub('\s+', ' ', query[2]),
+                'Runtime' : int(query[3])
+            })
+    return res
+
+
+def update_queries():
+    global GLOBALSTATS
+    dburl = dbconn.DbURL(dbname='template1')
+    conn = dbconn.connect(dburl)
+    while True:
+        try:
+            queries = get_queries(conn)
+            GLOBALSTATS['queries'] = queries
+        except Exception, ex:
+            logger.warning('Exception happened querying the database: "%s"' % str(ex))
+            try:
+                conn.close()
+                conn = dbconn.connect(dburl)
+            except Exception, ex:
+                pass
+        time.sleep(1)
+    conn.close()
+
+# GPDB QUERIES THREAD END
+
+
 # REST API SERVICE THREAD START
 
 @app.route('/getstats', methods=['GET'])
@@ -262,6 +323,9 @@ def main():
     # Start REST API first
     thread.start_new_thread(rest_api_main, (int(options.port),))
 
+    # Start thread for updating GPDB queries
+    thread.start_new_thread(update_queries, tuple())
+    
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     try:
@@ -275,6 +339,7 @@ def main():
         segs = array.getDbList()
 
         gpdb_hosts = get_gpdb_hosts(segs)
+        GLOBALSTATS['hosts'] = gpdb_hosts
         logger.debug('GPDB Configuration is:')
         for host in gpdb_hosts:
             logger.debug('    host "%s"' % host)
