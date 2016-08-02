@@ -114,7 +114,7 @@ def start_agents(pool, gpdb_hosts, tick, portoffset):
         logger.info("Listener started on port %d" % port)
         master = '%s:%d' % (masterhost, port)
         cmd = Command('Start GPQA Agent on %s' % hostname,
-                      '/gpqa/src/gpqa-agent-start -l %s -s %s -t %s' % (hostname, master, tick),
+                      '~/gpqa/src/gpqa-agent-start -l %s -s %s -t %s' % (hostname, master, tick),
                       ctxt = REMOTE,
                       remoteHost = hostname)
         pool.addCommand(cmd)
@@ -244,7 +244,7 @@ def execute(conn, query):
         curs = dbconn.execSQL(conn, query)
         res = curs.fetchall()
         conn.commit()
-        
+
     except Exception, ex:
         logger.error('Failed to execute the statement on the database. Please, check log file for errors.')
         logger.error(ex)
@@ -303,7 +303,7 @@ def get_stats():
 
 def rest_api_main(port):
     app.run(host='0.0.0.0', port=port)
-    
+
 # REST API SERVICE THREAD END
 
 def main():
@@ -325,7 +325,7 @@ def main():
 
     # Start thread for updating GPDB queries
     thread.start_new_thread(update_queries, tuple())
-    
+
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     try:
